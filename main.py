@@ -31,8 +31,6 @@ NOTE ON THE WEBHOOK SECRET HEADER:
   header set on any request so we can confirm and lock it down. Check the
   Railway logs after PropertyRadar's first test send.
 """
-from dotenv import load_dotenv
-load_dotenv()
 
 import csv
 import io
@@ -204,6 +202,17 @@ async def propertyradar_webhook(request: Request):
     radar_id = payload.get("RadarID")
     if not radar_id:
         raise HTTPException(status_code=400, detail="No RadarID in payload")
+
+    # Safeguard: if this property already has a terminal (paid-for) result,
+    # skip the expensive transactions call entirely. This protects against
+    # duplicate charges from a re-sent webhook, a retried PropertyRadar
+    # delivery, or manually using "Export to Integration" (which re-sends
+    # your WHOLE list, not just new items).
+    TERMINAL_STATUSES = {"complete", "partial_one_transfer", "no_transfers_found"}
+    existing = supabase.table("properties").select("radar_id, status").eq("radar_id", radar_id).execute()
+    if existing.data and existing.data[0].get("status") in TERMINAL_STATUSES:
+        print(f"Skipping {radar_id} — already processed (status: {existing.data[0].get('status')}), no charge made.")
+        return {"ok": True, "radar_id": radar_id, "status": "skipped_already_processed"}
 
     # Write a pending row immediately so the event is never lost even if
     # the transaction-history pull below fails or times out.
