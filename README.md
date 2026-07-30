@@ -73,10 +73,8 @@ matches your list criteria.
 - Supabase: free tier covers this easily unless the table grows into
   the hundreds of thousands of rows.
 
-## Known open item
+## Notes
 
-The exact HTTP header PropertyRadar uses to send the Webhook Secret
-isn't documented publicly. `main.py` currently checks a few likely
-header names (`X-Webhook-Secret`, `X-PropertyRadar-Secret`,
-`Authorization`) and logs all headers on every request so this can be
-confirmed against a real test payload and tightened up.
+- The webhook secret is sent by PropertyRadar as a standard
+  `Authorization: Bearer <secret>` header — confirmed against a real
+  webhook delivery, and this is what `main.py` checks.

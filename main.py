@@ -180,24 +180,19 @@ def process_radar_id(radar_id, payload):
 
 @app.post("/webhook/propertyradar")
 async def propertyradar_webhook(request: Request):
-    # Log all headers on every request while we confirm PropertyRadar's
-    # actual secret-header name from a real test send. Check Railway logs.
-    print("Incoming webhook headers:", dict(request.headers))
-
     body = await request.body()
     try:
         payload = json.loads(body)
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
+    # Confirmed against a real PropertyRadar webhook: they send the secret
+    # as a standard "Authorization: Bearer <secret>" header.
     if WEBHOOK_SECRET:
-        candidates = [
-            request.headers.get("x-webhook-secret"),
-            request.headers.get("x-propertyradar-secret"),
-            request.headers.get("authorization"),
-        ]
-        if WEBHOOK_SECRET not in [c for c in candidates if c]:
-            raise HTTPException(status_code=401, detail="Webhook secret did not match — check Railway logs for actual header names sent")
+        auth_header = request.headers.get("authorization", "")
+        expected = f"Bearer {WEBHOOK_SECRET}"
+        if auth_header != expected:
+            raise HTTPException(status_code=401, detail="Webhook secret did not match")
 
     radar_id = payload.get("RadarID")
     if not radar_id:
