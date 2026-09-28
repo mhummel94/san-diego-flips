@@ -28,6 +28,16 @@ ENVIRONMENT VARIABLES (set these in Railway's dashboard, not in code)
                               service needs write access), from the same page
   EXPORT_TOKEN                 a password you make up, required as
                               ?token=... on /export.csv
+  REALTYFEED_CLIENT_ID        MLS (Realtyfeed) client_id - see mls.py
+  REALTYFEED_CLIENT_SECRET    MLS (Realtyfeed) client_secret
+  REALTYFEED_API_KEY          OPTIONAL, only if your account needs x-api-key
+
+MLS ENRICHMENT (Phase 2):
+  After a new property is processed and recorded in the ledger, its APN is
+  looked up in the MLS in a background task (so PropertyRadar's webhook
+  gets its 200 immediately). An MLS failure can never cause a PropertyRadar
+  re-charge: the ledger is written BEFORE the MLS step runs. Logic lives in
+  mls.py and is shared with phase1_backfill.py.
 
 NOTE ON THE WEBHOOK SECRET HEADER:
   Confirmed against a real PropertyRadar webhook delivery: they send the
@@ -51,9 +61,11 @@ import threading
 from datetime import datetime, timedelta
 
 import requests
-from fastapi import FastAPI, Request, HTTPException, Query
+from fastapi import FastAPI, Request, HTTPException, Query, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from supabase import create_client, Client
+
+from mls import RealtyfeedClient, enrich_property
 
 app = FastAPI()
 
@@ -69,6 +81,7 @@ SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 BASE_URL = "https://api.propertyradar.com/v1/properties"
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_URL else None
+mls_client = RealtyfeedClient()  # reads REALTYFEED_* env vars; no-op if unset
 
 
 def pr_headers():
@@ -98,11 +111,12 @@ def fetch_property_specs(radar_id):
     Real, paid call (Purchase=1, charged per record returned) to
     PropertyRadar's single-property lookup endpoint. Fetches fields that
     are NOT reliably present in the webhook's own "New Match" payload:
-    property type, pool, lot size, garage size, and stories. Field names
-    confirmed directly from PropertyRadar's official API docs.
+    property type, pool, lot size, garage size, stories, and APN. APN rides
+    along on this same call (PropertyRadar charges per record, not per
+    field), so capturing it adds no extra PropertyRadar call.
     """
     url = f"{BASE_URL}/{radar_id}"
-    params = {"Fields": "PType,Pool,LotSize,GarageSize,Stories", "Purchase": 1}
+    params = {"Fields": "PType,Pool,LotSize,GarageSize,Stories,APN", "Purchase": 1}
 
     try:
         resp = requests.get(url, headers=pr_headers(), params=params, timeout=20)
@@ -128,6 +142,7 @@ def fetch_property_specs(radar_id):
         "lot_sqft": to_num_or_none(raw.get("LotSize")),
         "garage": to_num_or_none(raw.get("GarageSize")),
         "stories": to_num_or_none(raw.get("Stories")),
+        "apn": (raw.get("APN") or "").strip() or None,
     }
 
 
@@ -203,6 +218,7 @@ def process_radar_id(radar_id, payload):
         "lot_sqft": specs.get("lot_sqft"),
         "garage": specs.get("garage"),
         "stories": specs.get("stories"),
+        "apn": specs.get("apn") or (payload.get("APN") or "").strip() or None,
         "updated_at": datetime.utcnow().isoformat(),
     }
 
@@ -253,7 +269,7 @@ def process_radar_id(radar_id, payload):
 # ============================================================
 
 @app.post("/webhook/propertyradar")
-async def propertyradar_webhook(request: Request):
+async def propertyradar_webhook(request: Request, background_tasks: BackgroundTasks):
     body = await request.body()
     try:
         payload = json.loads(body)
@@ -308,7 +324,24 @@ async def propertyradar_webhook(request: Request):
         "last_status": record.get("status"),
     }).execute()
 
+    # Phase 2: MLS enrichment, AFTER the ledger write so an MLS problem can
+    # never make this RadarID look unpaid. Runs in the background so the
+    # webhook responds immediately.
+    if mls_client.configured:
+        background_tasks.add_task(run_mls_enrichment, record)
+
     return {"ok": True, "radar_id": radar_id, "status": record.get("status")}
+
+
+def run_mls_enrichment(record):
+    try:
+        summary = enrich_property(supabase, mls_client, record)
+        print(f"[mls] {record['radar_id']}: {summary.get('mls_status')} "
+              f"DOM={summary.get('days_on_market')} L/S={summary.get('list_to_sold_ratio')}")
+    except Exception as e:
+        # Never crash the service over enrichment; the row just keeps
+        # mls_status null and can be picked up by `phase1_backfill.py mls`.
+        print(f"[mls] ERROR enriching {record.get('radar_id')}: {e}")
 
 
 @app.get("/export.csv")
@@ -316,7 +349,15 @@ def export_csv(token: str = Query(...)):
     if not EXPORT_TOKEN or token != EXPORT_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid or missing token")
 
-    data = supabase.table("properties").select("*").execute().data
+    # Supabase returns at most 1000 rows per request, so page through
+    # everything (the table is already past 1000 rows).
+    data, start, page = [], 0, 1000
+    while True:
+        batch = supabase.table("properties").select("*").order("radar_id").range(start, start + page - 1).execute().data or []
+        data.extend(batch)
+        if len(batch) < page:
+            break
+        start += page
 
     output = io.StringIO()
     if data:
